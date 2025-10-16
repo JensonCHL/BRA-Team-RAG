@@ -623,7 +623,7 @@ def display_ocr_review_ui():
             st.rerun()
             
     with col3:
-        if st.button("✅ Proceed with Embedding", type="primary", key="proceed_embedding"):
+        if st.button("✅ Insert to Database", type="primary", key="proceed_embedding"):
             # Clean up session state and proceed
             reviewed_chunks = st.session_state.ocr_chunks_for_review.copy()
             if "ocr_chunks_for_review" in st.session_state:
