@@ -728,7 +728,7 @@ else:
 # ===============================
 # UI
 # ===============================
-st.title("📚 Contract Document Handling")
+st.title("📚 BRA Team Contract Document Handling")
 st.caption(f"Collection: `{QDRANT_COLLECTION}` · Qdrant: {QDRANT_URL}")
 
 # Check for successful ingestion and display success message
