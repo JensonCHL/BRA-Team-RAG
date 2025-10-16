@@ -36,18 +36,17 @@ st.set_page_config(page_title="RAG Ingestion (DEKA → Qdrant)",
                    page_icon="📚", layout="wide")
 
 # Authentication
-AUTH_EMAIL = os.getenv("AUTH_EMAIL", "")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "")
+AUTH_EMAIL = os.getenv("AUTH_EMAIL")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
 
 # Set your envs once (use your real values or .env)
 # You can also keep them in OS env already set in your system.
-QDRANT_URL = os.getenv(
-    "QDRANT_URL", "https://3e1cfc1c-d37b-4ccb-a069-003af0ff7d44.eu-west-2-0.aws.cloud.qdrant.io")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "DataStreamLit")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
 
-DEKA_BASE = os.getenv("DEKA_BASE_URL", "")
-DEKA_KEY = os.getenv("DEKA_KEY", "")
+DEKA_BASE = os.getenv("DEKA_BASE_URL")
+DEKA_KEY = os.getenv("DEKA_KEY")
 OCR_MODEL = "meta/llama-4-maverick-instruct"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "baai/bge-multilingual-gemma2")
 
