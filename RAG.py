@@ -448,7 +448,7 @@ def review_ocr_chunks(chunks, status_review):
                 st.rerun()
                 
         with col3:
-            proceed = st.button("✅ Proceed with Embedding", type="primary")
+            proceed = st.button("✅ Insert to Database", type="primary")
             cancel = st.button("❌ Cancel Ingestion")
             
         if proceed:
