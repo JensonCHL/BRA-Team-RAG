@@ -285,7 +285,12 @@ def run_ingestion(company: str, document_name: str, pdf_bytes: bytes,
     doc_id = deterministic_doc_hash(pdf_path, pdf_bytes)
     
     # Capture upload time in ISO format for consistency
-    upload_time = datetime.datetime.now().isoformat()
+    
+
+    # Get current time in that timezone
+    
+    upload_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
+
 
     # 1) OCR per page
     ocr_pages = ocr_pdf_with_deka(
