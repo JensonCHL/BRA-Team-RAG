@@ -32,7 +32,7 @@ load_dotenv()  # auto-load variables from .env
 # ===============================
 # ENV / CONFIG
 # ===============================
-st.set_page_config(page_title="RAG Ingestion (DEKA → Qdrant)",
+st.set_page_config(page_title="BRA Team Contract Document Handling",
                    page_icon="📚", layout="wide")
 
 # Authentication
@@ -308,7 +308,7 @@ def run_ingestion(company: str, document_name: str, pdf_bytes: bytes,
                 "company": company,
                 "source": document_name,
                 "page": page_info["page"],
-                "path": str(pdf_path.resolve()),
+                # "path": str(pdf_path.resolve()),
                 "doc_id": doc_id,
                 "words": page_info["words"],
                 "lang_mismatch": page_info["lang_mismatch"],
@@ -728,7 +728,7 @@ else:
 # ===============================
 # UI
 # ===============================
-st.title("📚 RAG Document Handling")
+st.title("📚 Contract Document Handling")
 st.caption(f"Collection: `{QDRANT_COLLECTION}` · Qdrant: {QDRANT_URL}")
 
 # Check for successful ingestion and display success message
