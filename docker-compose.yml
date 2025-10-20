@@ -1,33 +1,21 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  rag-app:
+  ingestionrag:
+    container_name: ingestionrag1
     build: .
+    image: ingestionrag1:latest
     ports:
-      - "80:8501"
-    volumes:
-      # Mount local directories for persistent data
-      - ./artifacts:/app/artifacts
-      - ./uploads:/app/uploads
-    environment:
-      # Environment variables will be loaded from .env file
-      - STREAMLIT_SERVER_ENABLE_CORS=false
-      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
+      - "80:80"
+    restart: always
     env_file:
       - .env
-    restart: unless-stopped
-    # Health check
+    volumes:
+      - ./uploads:/app/uploads
+      - ./artifacts:/app/artifacts
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:80/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-
-  # Watchtower service to automatically update containers when image changes
-  watchtower:
-    image: containrrr/watchtower
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 --cleanup
-    restart: unless-stopped
+      start_period: 5s
