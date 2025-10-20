@@ -1,4 +1,4 @@
-streamlit
+streamlit[auth]
 python-dotenv
 openai
 langchain-openai

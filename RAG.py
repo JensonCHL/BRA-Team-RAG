@@ -36,6 +36,9 @@ st.set_page_config(page_title="BRA Team Contract Document Handling",
                    page_icon="📚", layout="wide")
 
 # Authentication
+# Google OAuth configuration will be in secrets.toml
+AUTHORIZED_DOMAINS = os.getenv("AUTHORIZED_DOMAINS", "")  # Comma-separated list of domains
+# Password authentication
 AUTH_EMAIL = os.getenv("AUTH_EMAIL")
 AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
 
@@ -690,16 +693,35 @@ def delete_document_by_source(source_name: str):
 # ===============================
 # AUTHENTICATION
 # ===============================
+def is_authorized_domain(email):
+    """Check if the user's email domain is in the authorized domains list."""
+    if not AUTHORIZED_DOMAINS:
+        return True  # If no domains specified, allow all
+    
+    authorized_domains = [domain.strip() for domain in AUTHORIZED_DOMAINS.split(",")]
+    user_domain = email.split("@")[1] if "@" in email else ""
+    return user_domain in authorized_domains
+
+def is_authorized_account(email):
+    """Check if the user's email is in the authorized accounts list."""
+    # You can set AUTHORIZED_ACCOUNTS as a comma-separated list of emails in environment variables
+    authorized_accounts = os.getenv("AUTHORIZED_ACCOUNTS", "")
+    if not authorized_accounts:
+        return True  # If no accounts specified, allow all (when domains are restricted)
+    
+    authorized_emails = [email.strip() for email in authorized_accounts.split(",")]
+    return email in authorized_emails
+
 def check_password():
     """Returns `True` if the user has entered the correct email and password."""
     
-    # Return True if the user is already authenticated
+    # Return True if the user is already authenticated with password
     if st.session_state.get("password_correct", False):
         return True
 
     # Show input for email and password.
-    st.title("🔐 Login")
-    st.caption("Please enter your credentials to access the RAG application.")
+    st.title("🔐 Password Required")
+    st.caption("You've successfully signed in with Google. Please enter your application password to access the RAG application.")
     
     # Callback function to check credentials
     def password_entered():
@@ -707,7 +729,7 @@ def check_password():
         if (hmac.compare_digest(st.session_state["email"], AUTH_EMAIL) and
                 hmac.compare_digest(st.session_state["password"], AUTH_PASSWORD)):
             st.session_state["password_correct"] = True
-            st.success("Login successful!")
+            st.success("Password authentication successful!")
         else:
             st.session_state["password_correct"] = False
             st.error("😕 Email or password incorrect")
@@ -715,25 +737,80 @@ def check_password():
     # Input fields for email and password
     st.text_input("Email", key="email", autocomplete="email")
     st.text_input("Password", type="password", key="password")
-    st.button("Login", on_click=password_entered)
+    st.button("Authenticate", on_click=password_entered)
     
     # Always return False when showing the login form
     # This allows the form to be displayed without calling st.stop()
     return False
 
-# If AUTH_EMAIL and AUTH_PASSWORD are not set, skip authentication
-if not AUTH_EMAIL or not AUTH_PASSWORD:
-    st.warning("⚠️ Authentication not configured. Set AUTH_EMAIL and AUTH_PASSWORD environment variables to enable authentication.")
-else:
-    if not st.session_state.get("password_correct", False):
-        # Show login form but don't call st.stop()
-        check_password()
-        st.stop()
+def check_authentication():
+    """Handle Google OAuth authentication, domain restrictions, and password authentication."""
+    # Check if user is logged in with Google
+    if st.user.is_logged_in:
+        # Check domain restrictions if configured
+        user_email = getattr(st.user, 'email', '')
+        if user_email and not is_authorized_domain(user_email):
+            st.error(f"Access denied. Only users from authorized domains can access this application.")
+            st.button("Logout", on_click=st.logout)
+            st.stop()
+        
+        # Check account restrictions if configured
+        if user_email and not is_authorized_account(user_email):
+            st.error(f"Access denied. Your account is not authorized to access this application.")
+            st.button("Logout", on_click=st.logout)
+            st.stop()
+        
+        # User is authenticated with Google and authorized
+        # Now check password authentication
+        if not AUTH_EMAIL or not AUTH_PASSWORD:
+            st.warning("⚠️ Password authentication not configured. Set AUTH_EMAIL and AUTH_PASSWORD environment variables to enable password protection.")
+            return True
+        else:
+            return check_password()
+    else:
+        # Show Google login screen
+        st.title("🔐 Login")
+        st.caption("Please sign in with your Google account to access the RAG application.")
+        
+        # Show domain restriction info if configured
+        if AUTHORIZED_DOMAINS:
+            domains = ", ".join([domain.strip() for domain in AUTHORIZED_DOMAINS.split(",")])
+            st.info(f"Note: Only users from the following domains are authorized: {domains}")
+            
+        # Show account restriction info if configured
+        if os.getenv("AUTHORIZED_ACCOUNTS"):
+            st.info("Note: Only specific accounts are authorized to access this application.")
+        
+        # Google login button
+        if st.button("Sign in with Google"):
+            st.login()
+        
+        return False
+
+# Check authentication
+auth_result = check_authentication()
+if not auth_result:
+    st.stop()
 
 # ===============================
 # UI
 # ===============================
-st.title("📚 BRA Team Contract Document Handling")
+# Show user info and logout button
+col1, col2 = st.columns([4, 1])
+with col1:
+    st.title("📚 BRA Team Contract Document Handling")
+with col2:
+    if st.user.is_logged_in:
+        user_name = getattr(st.user, 'name', 'User')
+        user_email = getattr(st.user, 'email', '')
+        st.markdown(f"**{user_name}**")
+        st.caption(user_email)
+        if st.button("Logout"):
+            # Clear password authentication state when logging out
+            if "password_correct" in st.session_state:
+                del st.session_state.password_correct
+            st.logout()
+
 st.caption(f"Collection: `{QDRANT_COLLECTION}` · Qdrant: {QDRANT_URL}")
 
 # Check for successful ingestion and display success message
