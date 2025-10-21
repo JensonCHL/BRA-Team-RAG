@@ -19,15 +19,17 @@ import datetime
 import pandas as pd
 import hmac
 
+# TOTP MFA Libraries
+import pyotp
+import qrcode
+from PIL import Image
+
 # OCR / PDF
 import fitz  # PyMuPDF
-from PIL import Image
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
-# Qdrant + Embeddings
 
 load_dotenv()  # auto-load variables from .env
-
 
 # ===============================
 # ENV / CONFIG
@@ -35,15 +37,40 @@ load_dotenv()  # auto-load variables from .env
 st.set_page_config(page_title="BRA Team Contract Document Handling",
                    page_icon="📚", layout="wide")
 
-# Authentication
-# Google OAuth configuration will be in secrets.toml
-AUTHORIZED_DOMAINS = os.getenv("AUTHORIZED_DOMAINS", "")  # Comma-separated list of domains
-# Password authentication
-AUTH_EMAIL = os.getenv("AUTH_EMAIL")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
+# Authentication Configuration (Multi-User Support)
+# Load multiple user credentials from environment variables
+def load_user_credentials():
+    """Load user credentials from environment variables"""
+    users = {}
+    
+    # Check for multiple users (USER1_EMAIL, USER2_EMAIL, etc.)
+    i = 1
+    while True:
+        email_key = f"USER{i}_EMAIL"
+        password_key = f"USER{i}_PASSWORD"
+        
+        email = os.getenv(email_key)
+        password = os.getenv(password_key)
+        
+        if email and password:
+            users[email] = password
+            i += 1
+        else:
+            break
+    
+    # Fallback to single user if no multi-users defined
+    if not users:
+        auth_email = os.getenv("AUTH_EMAIL")
+        auth_password = os.getenv("AUTH_PASSWORD")
+        if auth_email and auth_password:
+            users[auth_email] = auth_password
+    
+    return users
 
-# Set your envs once (use your real values or .env)
-# You can also keep them in OS env already set in your system.
+# Load user credentials
+USER_CREDENTIALS = load_user_credentials()
+
+# Qdrant Configuration
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
@@ -59,8 +86,7 @@ ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Supabase
-# ---- Supabase (for Index Table)
-SUPABASE_URL = os.getenv("SUPABASE_URL")  # e.g. "https://xyzcompany.supabase.co"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_TABLE = "Indexing"
 
@@ -69,7 +95,6 @@ SUPABASE_TABLE = "Indexing"
 # ===============================
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 deka_client = OpenAI(api_key=DEKA_KEY, base_url=DEKA_BASE)
-
 
 def ensure_collection_and_indexes(dim: int):
     # Create collection if missing
@@ -92,7 +117,6 @@ def ensure_collection_and_indexes(dim: int):
             if "already exists" not in str(e).lower():
                 st.warning(f"Index create failed for {field}: {e}")
 
-
 def build_embedder() -> OpenAIEmbeddings:
     return OpenAIEmbeddings(
         api_key=DEKA_KEY,
@@ -105,7 +129,6 @@ def build_embedder() -> OpenAIEmbeddings:
 # HELPERS
 # ===============================
 
-
 def _clean_text(s: str) -> str:
     if not s:
         return ""
@@ -115,14 +138,12 @@ def _clean_text(s: str) -> str:
     s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
     return s.strip()
 
-
 def keep_language(text: str, allowed_langs=ALLOWED_LANGS) -> bool:
     try:
         lang = detect(text[:1000])
         return lang in allowed_langs
     except Exception:
         return True
-
 
 def deterministic_doc_hash(full_path: Path, content_bytes: bytes) -> str:
     """
@@ -136,7 +157,6 @@ def deterministic_doc_hash(full_path: Path, content_bytes: bytes) -> str:
         blob = hashlib.sha1(content_bytes).hexdigest()
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
-
 def page_image_base64(pdf_doc, page_index: int, zoom: float = 3.0) -> str:
     page = pdf_doc[page_index]
     mat = fitz.Matrix(zoom, zoom)
@@ -145,7 +165,6 @@ def page_image_base64(pdf_doc, page_index: int, zoom: float = 3.0) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
-
 
 def build_meta_header(meta: dict) -> str:
     company = (meta or {}).get("company", "N/A")
@@ -178,7 +197,6 @@ def add_to_supabase(company_name: str, document_name: str):
     except Exception as e:
         st.warning(f"Supabase insert error: {e}")
 
-
 def delete_from_supabase(document_name: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
         st.warning("Supabase credentials missing — skipping index delete.")
@@ -199,381 +217,235 @@ def delete_from_supabase(document_name: str):
         st.warning(f"Supabase delete error: {e}")
 
 # ===============================
-# OCR (DEKA Maverick) per page
+# TOTP MFA FUNCTIONS
 # ===============================
 
+# Simple file-based storage for TOTP secrets (in production, use a database)
+SECRETS_FILE = "user_secrets.json"
 
-def ocr_pdf_with_deka(pdf_path: Path, company: str, source_name: str, progress_ocr, status_ocr) -> List[dict]:
-    """
-    Returns a list of dicts:
-    { "page": int, "text": str, "lang_mismatch": bool, "words": int }
-    """
-    pages_out = []
-    doc = fitz.open(str(pdf_path))
-    total_pages = len(doc)
-    success_pages = 0
+def load_totp_secrets():
+    """Load TOTP secrets from file"""
+    if os.path.exists(SECRETS_FILE):
+        try:
+            with open(SECRETS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-    for i in range(total_pages):
-        status_ocr.write(f"🖼️ OCR page {i+1}/{total_pages}")
-        b64_image = page_image_base64(doc, i, zoom=3.0)
+def save_totp_secrets(secrets):
+    """Save TOTP secrets to file"""
+    with open(SECRETS_FILE, 'w') as f:
+        json.dump(secrets, f, indent=2)
 
-        # Call DEKA OCR
-        resp = deka_client.chat.completions.create(
-            model=OCR_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an OCR engine specialized in Indonesian/English legal and technical contracts. "
-                        "Your task is to extract text *exactly as it appears* in the document image, without rewriting or summarizing.\n\n"
-                        "Guidelines:\n"
-                        "- Preserve all line breaks, numbering, and indentation.\n"
-                        "- Keep all headers, footers, and notes if they appear in the image.\n"
-                        "- Preserve tables as text: keep rows and columns aligned with | separators. output it in Markdown table format Pad cells so that columns align visually.\n"
-                        "- Do not translate text — output exactly as in the document.\n"
-                        "- If a cell or field is blank, or contains only dots/dashes (e.g., '.....', '—'), write N/A.\n"
-                        "- Keep units, percentages, currency (e.g., m², kVA, %, Rp.) exactly as written.\n"
-                        "- If text is unclear, output it as ??? instead of guessing."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Extract the text from this page {i+1} of the PDF."},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64_image}"}}
-                    ]
-                }
-            ],
-            max_tokens=8000,
-            temperature=0,
-            timeout=120
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        text = _clean_text(text)
+def generate_totp_secret():
+    """Generate a new TOTP secret"""
+    return pyotp.random_base32()
 
-        # language check + counts
-        lang_ok = keep_language(text, allowed_langs=ALLOWED_LANGS)
-        words = len(text.split())
+def generate_qr_code(provisioning_uri):
+    """Generate QR code for TOTP setup"""
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(provisioning_uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to bytes for Streamlit
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
-        pages_out.append({
-            "page": i + 1,
-            "text": text,
-            "lang_mismatch": not lang_ok,
-            "words": words,
-        })
-        success_pages += 1
-        progress_ocr.progress(int((success_pages / total_pages) * 100))
-
-    doc.close()
-    status_ocr.write("✅ OCR complete")
-    return pages_out
+def verify_totp(secret, token):
+    """Verify TOTP token"""
+    totp = pyotp.TOTP(secret)
+    return totp.verify(token)
 
 # ===============================
-# Ingestion runner (append mode)
+# AUTHENTICATION
 # ===============================
 
-
-def run_ingestion(company: str, document_name: str, pdf_bytes: bytes,
-                  progress_ocr, status_ocr,
-                  progress_embed, status_embed,
-                  progress_upload, status_upload):
-    # Save uploaded PDF (organized by company)
-    save_dir = Path("uploads") / company
-    save_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = save_dir / document_name
-    pdf_path.write_bytes(pdf_bytes)
-
-    # Create doc hash for stable IDs
-    doc_id = deterministic_doc_hash(pdf_path, pdf_bytes)
+def check_password():
+    """Returns `True` if the user has entered the correct email and password."""
     
-    # Capture upload time in ISO format for consistency
+    # Return True if the user is already authenticated with password
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Show input for email and password.
+    st.title("🔐 Login")
+    st.caption("Please enter your email and password to access the application.")
     
-
-    # Get current time in that timezone
-    
-    upload_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
-
-
-    # 1) OCR per page
-    ocr_pages = ocr_pdf_with_deka(
-        pdf_path, company, document_name, progress_ocr, status_ocr)
-
-    # 2) Build chunks (here: 1 chunk per page + header as you do)
-    chunks = []
-    for page_info in ocr_pages:
-        t = page_info["text"]
-        if not t:
-            continue
-        header = build_meta_header(
-            {"company": company, "source": document_name, "page": page_info["page"]})
-        full_text = (header + t).strip()
-
-        chunks.append({
-            "id_raw": f"{doc_id}:{page_info['page']}",
-            "text": full_text,
-            "meta": {
-                "company": company,
-                "source": document_name,
-                "page": page_info["page"],
-                # "path": str(pdf_path.resolve()),
-                "doc_id": doc_id,
-                "words": page_info["words"],
-                "lang_mismatch": page_info["lang_mismatch"],
-                "upload_time": upload_time,
-            }
-        })
-
-    # 3) Embeddings
-    status_embed.write(f"🔎 Building embeddings for {len(chunks)} chunks")
-    embedder = build_embedder()
-    # detect dim
-    dim = len(embedder.embed_query("hello world"))
-
-    # Ensure collection exists + indexes (append mode)
-    ensure_collection_and_indexes(dim)
-
-    vectors = []
-    ids = []
-    payloads = []
-
-    total = len(chunks)
-    done = 0
-    for i in range(0, total, BATCH_SIZE):
-        batch = chunks[i:i + BATCH_SIZE]
-        texts = [c["text"] for c in batch]
-        vecs = embedder.embed_documents(texts)
-        vectors.extend(vecs)
-
-        for c in batch:
-            pid = str(uuid.uuid5(uuid.NAMESPACE_URL, c["id_raw"]))
-            ids.append(pid)
-            payloads.append({
-                "content": c["text"],
-                "metadata": c["meta"]
-            })
-
-        done += len(batch)
-        progress_embed.progress(int((done / total) * 100))
-
-    status_embed.write("✅ Embedding complete")
-
-    # 4) Upsert to Qdrant (append)
-    status_upload.write(
-        f"☁️ Uploading {len(ids)} points to Qdrant (append mode)")
-    n = len(ids)
-    uploaded = 0
-    for i in range(0, n, BATCH_SIZE):
-        pts = [
-            rest.PointStruct(
-                id=ids[j],
-                vector=vectors[j],
-                payload=payloads[j]
-            )
-            for j in range(i, min(i + BATCH_SIZE, n))
-        ]
-        client.upsert(collection_name=QDRANT_COLLECTION, points=pts, wait=True)
-        uploaded += len(pts)
-        progress_upload.progress(int((uploaded / n) * 100))
-
-    status_upload.write("✅ Upload complete")
-    
-    # aDD TO SUPABASE
-    add_to_supabase(company, document_name)
-    
-    return {
-        "doc_id": doc_id,
-        "chunks": len(chunks),
-        "uploaded": len(ids),
-        "collection": QDRANT_COLLECTION,
-        # ✅ return all extracted text
-        "chunk_texts": [c["text"] for c in chunks]
-    }
-
-
-# ===============================
-# OCR Chunk Review Helper
-# ===============================
-
-def review_ocr_chunks(chunks, status_review):
-    """
-    Display OCR chunks to user for review and editing.
-    Returns the reviewed chunks or None if cancelled.
-    """
-    status_review.write(f"📝 Review {len(chunks)} OCR chunks before embedding")
-    
-    reviewed_chunks = []
-    edited_count = 0
-    
-    # Create a container for the review UI
-    review_container = st.container()
-    
-    with review_container:
-        st.subheader(f"Review OCR Chunks ({len(chunks)} pages)")
-        st.caption("You can edit the text in each chunk. Click 'Proceed with Embedding' when done.")
+    # Callback function to check credentials
+    def password_entered():
+        """Checks whether email and password are correct."""
+        email = st.session_state["email"]
+        password = st.session_state["password"]
         
-        # Store edited chunks in session state to persist across reruns
-        if "reviewed_chunks" not in st.session_state:
-            st.session_state.reviewed_chunks = chunks.copy()
-            
-        # Display each chunk in an expander
-        for i, chunk in enumerate(st.session_state.reviewed_chunks):
-            with st.expander(f"📄 Page {chunk['meta']['page']} ({chunk['meta']['words']} words)", expanded=(i==0)):
-                # Display metadata
-                cols = st.columns(4)
-                cols[0].write(f"**Page:** {chunk['meta']['page']}")
-                cols[1].write(f"**Words:** {chunk['meta']['words']}")
-                cols[2].write(f"**Language OK:** {'✅' if not chunk['meta']['lang_mismatch'] else '❌'}")
-                cols[3].write(f"**Doc ID:** {chunk['meta']['doc_id'][:8]}...")
-                
-                # Editable text area for the chunk content
-                edited_text = st.text_area(
-                    "Content (editable)",
-                    value=chunk["text"],
-                    height=300,
-                    key=f"chunk_edit_{i}",
-                    help="Edit the OCR text if needed. Changes will be preserved for embedding."
-                )
-                
-                # Update the chunk in session state if edited
-                if edited_text != chunk["text"]:
-                    st.session_state.reviewed_chunks[i]["text"] = edited_text
-                    st.session_state.reviewed_chunks[i]["meta"]["words"] = len(edited_text.split())
-                    edited_count += 1
-        
-        # Summary and action buttons
-        st.divider()
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            st.write(f"📝 Edited {edited_count} chunk{'s' if edited_count != 1 else ''}")
-            
-        with col2:
-            if st.button("↩️ Reset All Edits"):
-                st.session_state.reviewed_chunks = chunks.copy()
-                st.success("All edits reset!")
-                time.sleep(1)
-                st.rerun()
-                
-        with col3:
-            proceed = st.button("✅ Insert to Database", type="primary")
-            cancel = st.button("❌ Cancel Ingestion")
-            
-        if proceed:
-            # Clean up session state
-            reviewed_chunks = st.session_state.reviewed_chunks.copy()
-            if "reviewed_chunks" in st.session_state:
-                del st.session_state.reviewed_chunks
-            return reviewed_chunks
-            
-        if cancel:
-            # Clean up session state
-            if "reviewed_chunks" in st.session_state:
-                del st.session_state.reviewed_chunks
-            return None
-    
-# ===============================
-# OCR Chunk Review Helper
-# ===============================
+        # Check if user exists and password matches
+        if email in USER_CREDENTIALS and hmac.compare_digest(password, USER_CREDENTIALS[email]):
+            st.session_state["password_correct"] = True
+            st.session_state["user_email"] = email
+            st.success("Password authentication successful!")
+        else:
+            st.session_state["password_correct"] = False
+            st.error("😕 Email or password incorrect")
 
-def display_ocr_review_ui():
-    """Display the OCR review UI if there are chunks in session state"""
-    if "ocr_chunks_for_review" not in st.session_state:
+    # Input fields for email and password
+    st.text_input("Email", key="email", autocomplete="email")
+    st.text_input("Password", type="password", key="password")
+    st.button("Authenticate", on_click=password_entered)
+    
+    # Always return False when showing the login form
+    return False
+
+def setup_totp():
+    """Setup TOTP MFA for the user"""
+    st.title("📱 Multi-Factor Authentication Setup")
+    st.caption("Set up your authenticator app for enhanced security.")
+    
+    user_email = st.session_state.get("user_email", "")
+    if not user_email:
+        st.error("Unable to get user email for MFA setup")
         return False
     
-    chunks = st.session_state.ocr_chunks_for_review
-    if not chunks:
+    # Load existing secrets
+    secrets = load_totp_secrets()
+    
+    # Check if user already has MFA set up
+    if user_email in secrets:
+        st.info("MFA is already set up for your account.")
+        st.session_state["totp_setup_complete"] = True
+        return True
+    
+    st.info("To set up MFA, please scan the QR code below with your authenticator app (Google Authenticator, Authy, etc.)")
+    
+    # Generate a new secret for the user if not already in session
+    if "totp_secret" not in st.session_state:
+        secret = generate_totp_secret()
+        st.session_state["totp_secret"] = secret
+        # Save the secret temporarily
+        secrets[user_email] = secret
+        save_totp_secrets(secrets)
+    
+    secret = st.session_state["totp_secret"]
+    
+    # Generate provisioning URI and QR code
+    totp = pyotp.TOTP(secret)
+    provisioning_uri = totp.provisioning_uri(
+        name=user_email,
+        issuer_name="RAG Application"
+    )
+    
+    qr_code_bytes = generate_qr_code(provisioning_uri)
+    
+    # Display QR code
+    st.image(qr_code_bytes, caption="Scan this QR code with your authenticator app", width=300)
+    
+    # Show secret key for manual entry
+    st.info("If you can't scan the QR code, enter this key manually in your authenticator app:")
+    st.code(secret, language=None)
+    
+    # Verification form
+    st.subheader("Verify Setup")
+    st.caption("Enter a 6-digit code from your authenticator app to complete setup.")
+    
+    with st.form("totp_verification"):
+        verification_code = st.text_input("6-digit code", max_chars=6, key="verification_code")
+        submitted = st.form_submit_button("Verify and Enable MFA")
+        
+        if submitted:
+            if verification_code and len(verification_code) == 6 and verification_code.isdigit():
+                if verify_totp(secret, verification_code):
+                    st.session_state["totp_setup_complete"] = True
+                    st.success("✅ MFA setup successful! You're now protected with two-factor authentication.")
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error("Invalid code. Please make sure you're entering the current code from your authenticator app.")
+            else:
+                st.error("Please enter a valid 6-digit code.")
+    
+    return False
+
+def check_totp():
+    """Verify TOTP code for MFA"""
+    user_email = st.session_state.get("user_email", "")
+    if not user_email:
+        st.error("Authentication error: User email not found")
         return False
-        
-    st.subheader(f"🔍 Review OCR Chunks ({len(chunks)} pages)")
-    st.caption("Review and edit the OCR results before proceeding with embedding.")
     
-    edited_count = 0
+    # Load secrets
+    secrets = load_totp_secrets()
     
-    # Display each chunk in an expander
-    for i, chunk in enumerate(chunks):
-        with st.expander(f"📄 Page {chunk['meta']['page']} ({chunk['meta']['words']} words)", expanded=(i==0)):
-            # Display metadata
-            cols = st.columns(4)
-            cols[0].write(f"**Page:** {chunk['meta']['page']}")
-            cols[1].write(f"**Words:** {chunk['meta']['words']}")
-            cols[2].write(f"**Language OK:** {'✅' if not chunk['meta']['lang_mismatch'] else '❌'}")
-            cols[3].write(f"**Doc ID:** {chunk['meta']['doc_id'][:8]}...")
-            
-            # Editable text area for the chunk content
-            edited_text = st.text_area(
-                "Content (editable)",
-                value=chunk["text"],
-                height=300,
-                key=f"chunk_edit_{i}",
-                help="Edit the OCR text if needed. Changes will be preserved for embedding."
-            )
-            
-            # Update the chunk in session state if edited
-            if edited_text != chunk["text"]:
-                st.session_state.ocr_chunks_for_review[i]["text"] = edited_text
-                st.session_state.ocr_chunks_for_review[i]["meta"]["words"] = len(edited_text.split())
-                edited_count += 1
+    # Check if user has completed setup but hasn't verified yet
+    if st.session_state.get("totp_setup_complete", False) and not st.session_state.get("totp_verified", False):
+        st.success("✅ MFA setup complete! Please enter a code from your authenticator app to verify.")
     
-    # Summary and action buttons (outside the form to avoid conflicts)
-    st.divider()
-    col1, col2, col3 = st.columns([2, 1, 1])
+    # Check if user has MFA set up
+    if user_email not in secrets:
+        return setup_totp()
     
-    with col1:
-        st.write(f"📝 Edited {edited_count} chunk{'s' if edited_count != 1 else ''}")
-        
-    with col2:
-        if st.button("↩️ Reset All Edits", key="reset_edits"):
-            # Reset to original OCR results
-            st.session_state.ocr_chunks_for_review = st.session_state.original_ocr_chunks.copy()
-            st.success("All edits reset!")
-            time.sleep(1)
-            st.rerun()
-            
-    with col3:
-        # Use st.button outside of any form to avoid conflicts
-        if st.button("✅ Proceed with Embedding", key="proceed_embedding"):
-            # Clean up session state and proceed
-            reviewed_chunks = st.session_state.ocr_chunks_for_review.copy()
-            if "ocr_chunks_for_review" in st.session_state:
-                del st.session_state.ocr_chunks_for_review
-            if "original_ocr_chunks" in st.session_state:
-                del st.session_state.original_ocr_chunks
-            if "awaiting_review" in st.session_state:
-                del st.session_state.awaiting_review
-                
-            # Store the reviewed chunks for the next step
-            st.session_state.reviewed_chunks = reviewed_chunks
-            st.session_state.ready_for_embedding = True
-            st.rerun()
-        
-        if st.button("❌ Cancel Ingestion", key="cancel_ingestion"):
-            # Clean up session state
-            for key in ["ocr_chunks_for_review", "original_ocr_chunks", "awaiting_review", "reviewed_chunks", "ready_for_embedding"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.warning("Ingestion cancelled by user.")
-            time.sleep(1)
-            st.rerun()
-        
-    return True
+    # If already verified, return True
+    if st.session_state.get("totp_verified", False):
+        return True
+    
+    # Show TOTP verification form
+    st.title("📱 Two-Factor Authentication")
+    st.caption("Enter the 6-digit code from your authenticator app.")
+    
+    def verify_totp_code():
+        """Verify the TOTP code entered by the user"""
+        code = st.session_state.get("totp_code", "")
+        if code and len(code) == 6 and code.isdigit():
+            secret = secrets[user_email]
+            if verify_totp(secret, code):
+                st.session_state["totp_verified"] = True
+                st.success("Authentication successful!")
+            else:
+                st.session_state["totp_error"] = "Invalid code. Please try again."
+        else:
+            st.session_state["totp_error"] = "Please enter a valid 6-digit code."
+    
+    # Input for TOTP code
+    st.text_input("6-digit code", 
+                  key="totp_code", 
+                  max_chars=6,
+                  placeholder="Enter code from your authenticator app",
+                  on_change=verify_totp_code)
+    
+    if "totp_error" in st.session_state:
+        st.error(st.session_state["totp_error"])
+        del st.session_state["totp_error"]
+    
+    st.button("Verify", on_click=verify_totp_code)
+    
+    # Option to reset MFA
+    st.caption("Having trouble with MFA?")
+    if st.button("Reset MFA Setup"):
+        if user_email in secrets:
+            del secrets[user_email]
+            save_totp_secrets(secrets)
+        # Clear session state
+        for key in ["totp_secret", "totp_setup_complete", "totp_verified"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
+    
+    return False
 
-def format_datetime(dt_str):
-    """Format datetime string for display"""
-    if dt_str == "Unknown Time":
-        return dt_str
-    try:
-        # Try to parse ISO format
-        dt = datetime.datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except:
-        # Return as is if parsing fails
-        return dt_str
+def check_authentication():
+    """Handle HMAC password authentication and TOTP MFA."""
+    # First check password authentication
+    password_auth_passed = check_password()
+    
+    # If password authentication passed, check TOTP MFA
+    if password_auth_passed:
+        return check_totp()
+    
+    return False
 
 # ===============================
-# OCR Chunk Review Helper
+# OCR REVIEW UI FUNCTION
 # ===============================
-
 def display_ocr_review_ui():
     """Display the OCR review UI if there are chunks in session state"""
     if "ocr_chunks_for_review" not in st.session_state:
@@ -652,6 +524,74 @@ def display_ocr_review_ui():
         
     return True
 
+# ===============================
+# OTHER HELPER FUNCTIONS
+# ===============================
+def ocr_pdf_with_deka(pdf_path: Path, company: str, source_name: str, progress_ocr, status_ocr) -> List[dict]:
+    """
+    Returns a list of dicts:
+    { "page": int, "text": str, "lang_mismatch": bool, "words": int }
+    """
+    pages_out = []
+    doc = fitz.open(str(pdf_path))
+    total_pages = len(doc)
+    success_pages = 0
+
+    for i in range(total_pages):
+        status_ocr.write(f"🖼️ OCR page {i+1}/{total_pages}")
+        b64_image = page_image_base64(doc, i, zoom=3.0)
+
+        # Call DEKA OCR
+        resp = deka_client.chat.completions.create(
+            model=OCR_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an OCR engine specialized in Indonesian/English legal and technical contracts. "
+                        "Your task is to extract text *exactly as it appears* in the document image, without rewriting or summarizing.\n\n"
+                        "Guidelines:\n"
+                        "- Preserve all line breaks, numbering, and indentation.\n"
+                        "- Keep all headers, footers, and notes if they appear in the image.\n"
+                        "- Preserve tables as text: keep rows and columns aligned with | separators. output it in Markdown table format Pad cells so that columns align visually.\n"
+                        "- Do not translate text — output exactly as in the document.\n"
+                        "- If a cell or field is blank, or contains only dots/dashes (e.g., '.....', '—'), write N/A.\n"
+                        "- Keep units, percentages, currency (e.g., m², kVA, %, Rp.) exactly as written.\n"
+                        "- If text is unclear, output it as ??? instead of guessing."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Extract the text from this page {i+1} of the PDF."},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64_image}"}}
+                    ]
+                }
+            ],
+            max_tokens=8000,
+            temperature=0,
+            timeout=120
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        text = _clean_text(text)
+
+        # language check + counts
+        lang_ok = keep_language(text, allowed_langs=ALLOWED_LANGS)
+        words = len(text.split())
+
+        pages_out.append({
+            "page": i + 1,
+            "text": text,
+            "lang_mismatch": not lang_ok,
+            "words": words,
+        })
+        success_pages += 1
+        progress_ocr.progress(int((success_pages / total_pages) * 100))
+
+    doc.close()
+    status_ocr.write("✅ OCR complete")
+    return pages_out
 
 def list_documents(limit: int = 1000):
     pts, _ = client.scroll(
@@ -676,7 +616,6 @@ def list_documents(limit: int = 1000):
         docs[source]["chunks"] += 1
     return docs
 
-
 def delete_document_by_source(source_name: str):
     client.delete(
         collection_name=QDRANT_COLLECTION,
@@ -689,103 +628,17 @@ def delete_document_by_source(source_name: str):
     )
     delete_from_supabase(source_name)
 
-
-# ===============================
-# AUTHENTICATION
-# ===============================
-def is_authorized_domain(email):
-    """Check if the user's email domain is in the authorized domains list."""
-    if not AUTHORIZED_DOMAINS:
-        return True  # If no domains specified, allow all
-    
-    authorized_domains = [domain.strip() for domain in AUTHORIZED_DOMAINS.split(",")]
-    user_domain = email.split("@")[1] if "@" in email else ""
-    return user_domain in authorized_domains
-
-def is_authorized_account(email):
-    """Check if the user's email is in the authorized accounts list."""
-    # You can set AUTHORIZED_ACCOUNTS as a comma-separated list of emails in environment variables
-    authorized_accounts = os.getenv("AUTHORIZED_ACCOUNTS", "")
-    if not authorized_accounts:
-        return True  # If no accounts specified, allow all (when domains are restricted)
-    
-    authorized_emails = [email.strip() for email in authorized_accounts.split(",")]
-    return email in authorized_emails
-
-def check_password():
-    """Returns `True` if the user has entered the correct email and password."""
-    
-    # Return True if the user is already authenticated with password
-    if st.session_state.get("password_correct", False):
-        return True
-
-    # Show input for email and password.
-    st.title("🔐 Password Required")
-    st.caption("You've successfully signed in with Google. Please enter your application password to access the RAG application.")
-    
-    # Callback function to check credentials
-    def password_entered():
-        """Checks whether a password entered by the user is correct."""
-        if (hmac.compare_digest(st.session_state["email"], AUTH_EMAIL) and
-                hmac.compare_digest(st.session_state["password"], AUTH_PASSWORD)):
-            st.session_state["password_correct"] = True
-            st.success("Password authentication successful!")
-        else:
-            st.session_state["password_correct"] = False
-            st.error("😕 Email or password incorrect")
-
-    # Input fields for email and password
-    st.text_input("Email", key="email", autocomplete="email")
-    st.text_input("Password", type="password", key="password")
-    st.button("Authenticate", on_click=password_entered)
-    
-    # Always return False when showing the login form
-    # This allows the form to be displayed without calling st.stop()
-    return False
-
-def check_authentication():
-    """Handle Google OAuth authentication, domain restrictions, and password authentication."""
-    # Check if user is logged in with Google
-    if st.user.is_logged_in:
-        # Check domain restrictions if configured
-        user_email = getattr(st.user, 'email', '')
-        if user_email and not is_authorized_domain(user_email):
-            st.error(f"Access denied. Only users from authorized domains can access this application.")
-            st.button("Logout", on_click=st.logout)
-            st.stop()
-        
-        # Check account restrictions if configured
-        if user_email and not is_authorized_account(user_email):
-            st.error(f"Access denied. Your account is not authorized to access this application.")
-            st.button("Logout", on_click=st.logout)
-            st.stop()
-        
-        # User is authenticated with Google and authorized
-        # Now check password authentication
-        if not AUTH_EMAIL or not AUTH_PASSWORD:
-            st.warning("⚠️ Password authentication not configured. Set AUTH_EMAIL and AUTH_PASSWORD environment variables to enable password protection.")
-            return True
-        else:
-            return check_password()
-    else:
-        # Show Google login screen
-        st.title("🔐 Login")
-        st.caption("Please sign in with your Google account to access the RAG application.")
-        
-        # Show domain restriction info if configured
-        if AUTHORIZED_DOMAINS:
-            domains = ", ".join([domain.strip() for domain in AUTHORIZED_DOMAINS.split(",")])
-            st.info(f"Note: Only users from the following domains are authorized: {domains}")
-            
-        # Show account restriction info if configured
-        if os.getenv("AUTHORIZED_ACCOUNTS"):
-            st.info("Note: Only specific accounts are authorized to access this application.")
-        
-        # Google login button
-        if st.button("Sign in with Google"):
-            st.login()
-        
-        return False
+def format_datetime(dt_str):
+    """Format datetime string for display"""
+    if dt_str == "Unknown Time":
+        return dt_str
+    try:
+        # Try to parse ISO format
+        dt = datetime.datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        # Return as is if parsing fails
+        return dt_str
 
 # Check authentication
 auth_result = check_authentication()
@@ -800,18 +653,40 @@ col1, col2 = st.columns([4, 1])
 with col1:
     st.title("📚 BRA Team Contract Document Handling")
 with col2:
-    if st.user.is_logged_in:
-        user_name = getattr(st.user, 'name', 'User')
-        user_email = getattr(st.user, 'email', '')
-        st.markdown(f"**{user_name}**")
-        st.caption(user_email)
-        if st.button("Logout"):
-            # Clear password authentication state when logging out
-            if "password_correct" in st.session_state:
-                del st.session_state.password_correct
-            st.logout()
+    st.markdown(f"**{st.session_state['user_email']}**")
+    if st.button("Logout"):
+        # Clear all authentication state when logging out
+        for key in list(st.session_state.keys()):
+            if key.startswith(("password_", "totp_", "user_")):
+                del st.session_state[key]
+        # Rerun to show login screen
+        st.rerun()
 
 st.caption(f"Collection: `{QDRANT_COLLECTION}` · Qdrant: {QDRANT_URL}")
+
+# MFA Management Section
+with st.expander("🔒 Multi-Factor Authentication Settings"):
+    secrets = load_totp_secrets()
+    user_email = st.session_state.get("user_email", "")
+    
+    if user_email in secrets:
+        st.success("✅ MFA is enabled for your account")
+        if st.button("Disable MFA"):
+            if user_email in secrets:
+                del secrets[user_email]
+                save_totp_secrets(secrets)
+                # Also clear session state
+                for key in ["totp_secret", "totp_setup_complete", "totp_verified"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.success("MFA has been disabled for your account")
+                time.sleep(1)
+                st.rerun()
+    else:
+        st.warning("⚠️ MFA is not enabled for your account")
+        if st.button("Enable MFA"):
+            st.session_state["totp_setup_complete"] = False
+            st.rerun()
 
 # Check for successful ingestion and display success message
 if st.session_state.get("ingestion_success", False):
@@ -1049,7 +924,6 @@ if go:
                 st.error(f"🚫 OCR processing failed: {e}")
                 st.error(f"Error details: {str(e)}")
 
-
 # Display OCR review UI if there are chunks to review
 display_ocr_review_ui()
 
@@ -1110,16 +984,20 @@ if docs:
             key="documents_table"
         )
     
-    # Automatically update session state with current selections
+    # Update session state with current selections only when delete button is pressed
+    # For now, just show the count of currently selected items in the UI
     current_selections = {row["Source"] for row in edited_df if row["Select"]}
-    st.session_state.selected_documents = current_selections
+    selection_changed = current_selections != st.session_state.selected_documents
     
-    # Show currently selected documents
-    if st.session_state.selected_documents:
-        st.write(f"Selected {len(st.session_state.selected_documents)} document(s) for deletion:")
+    if selection_changed:
+        st.info(f"Selection updated: {len(current_selections)} document(s) selected. Click 'Delete Selected Documents' to proceed.")
+    
+    # Show currently selected documents (from the data editor, not session state)
+    if current_selections:
+        st.write(f"Selected {len(current_selections)} document(s) for deletion:")
         
         # Show selected documents (limit to first 10 for space)
-        selected_list = list(st.session_state.selected_documents)
+        selected_list = list(current_selections)
         for doc_source in selected_list[:10]:
             st.write(f"- {doc_source}")
         if len(selected_list) > 10:
@@ -1128,8 +1006,11 @@ if docs:
         st.markdown("---")
         if st.button("🗑️ Delete Selected Documents", type="primary"):
             try:
+                # Update session state with current selections when delete is pressed
+                st.session_state.selected_documents = current_selections
+                
                 deleted_count = 0
-                for doc_source in list(st.session_state.selected_documents):
+                for doc_source in list(current_selections):
                     delete_document_by_source(doc_source)
                     deleted_count += 1
                 
@@ -1147,6 +1028,8 @@ if docs:
                 st.error(f"Deletion failed: {e}")
     else:
         st.info("Check boxes in the table to select documents for deletion.")
+        # Clear session state if no selections
+        st.session_state.selected_documents.clear()
 else:
     st.info("No points yet. Ingest a PDF above to start populating.")
 

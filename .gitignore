@@ -41,6 +41,9 @@ ENV/
 .streamlit/secrets.toml
 !.streamlit/secrets.toml.example
 
+# MFA Secrets (sensitive data)
+user_secrets.json
+
 # Uploads and artifacts (can be large)
 uploads/
 artifacts/

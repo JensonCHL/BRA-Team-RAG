@@ -1,4 +1,5 @@
 streamlit[auth]
+streamlit-auth-mfa
 python-dotenv
 openai
 langchain-openai
@@ -9,3 +10,5 @@ langdetect
 pandas
 requests
 uuid
+pyotp
+qrcode[pil]
