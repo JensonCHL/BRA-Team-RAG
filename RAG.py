@@ -448,39 +448,65 @@ def check_authentication():
 # ===============================
 def display_ocr_review_ui():
     """Display the OCR review UI if there are chunks in session state"""
-    if "ocr_chunks_for_review" not in st.session_state:
+    if "ocr_chunks_by_document" not in st.session_state:
         return False
     
-    chunks = st.session_state.ocr_chunks_for_review
-    st.subheader(f"🔍 Review OCR Chunks ({len(chunks)} pages)")
+    chunks_by_document = st.session_state.ocr_chunks_by_document
+    total_chunks = sum(len(chunks) for chunks in chunks_by_document.values())
+    
+    st.subheader(f"🔍 Review OCR Chunks ({len(chunks_by_document)} documents, {total_chunks} pages)")
     st.caption("Review and edit the OCR results before proceeding with embedding.")
+    
+    # Auto-proceed timer
+    if "review_start_time" in st.session_state:
+        elapsed_time = time.time() - st.session_state.review_start_time
+        remaining_time = max(0, 120 - elapsed_time)  # 2 minutes = 120 seconds
+        
+        if elapsed_time >= 120:
+            # Timer expired, auto-proceed
+            proceed_with_embedding()
+            return True
+        else:
+            # Show remaining time
+            st.info(f"⏰ Auto-proceed in {int(remaining_time)} seconds if no edits are made")
     
     edited_count = 0
     
-    # Display each chunk in an expander
-    for i, chunk in enumerate(chunks):
-        with st.expander(f"📄 Page {chunk['meta']['page']} ({chunk['meta']['words']} words)", expanded=(i==0)):
-            # Display metadata
-            cols = st.columns(4)
-            cols[0].write(f"**Page:** {chunk['meta']['page']}")
-            cols[1].write(f"**Words:** {chunk['meta']['words']}")
-            cols[2].write(f"**Language OK:** {'✅' if not chunk['meta']['lang_mismatch'] else '❌'}")
-            cols[3].write(f"**Doc ID:** {chunk['meta']['doc_id'][:8]}...")
-            
-            # Editable text area for the chunk content
-            edited_text = st.text_area(
-                "Content (editable)",
-                value=chunk["text"],
-                height=300,
-                key=f"chunk_edit_{i}",
-                help="Edit the OCR text if needed. Changes will be preserved for embedding."
-            )
-            
-            # Update the chunk in session state if edited
-            if edited_text != chunk["text"]:
-                st.session_state.ocr_chunks_for_review[i]["text"] = edited_text
-                st.session_state.ocr_chunks_for_review[i]["meta"]["words"] = len(edited_text.split())
-                edited_count += 1
+    # Display each document in a separate expander
+    for doc_name, chunks in chunks_by_document.items():
+        with st.expander(f"📄 Document: {doc_name} ({len(chunks)} pages)", expanded=(list(chunks_by_document.keys()).index(doc_name) == 0)):
+            # Display each chunk for this document
+            for i, chunk in enumerate(chunks):
+                # Find the global index for this chunk
+                global_idx = 0
+                for prev_doc, prev_chunks in chunks_by_document.items():
+                    if prev_doc == doc_name:
+                        global_idx += i
+                        break
+                    global_idx += len(prev_chunks)
+                
+                with st.container(border=True):
+                    # Display metadata
+                    cols = st.columns(4)
+                    cols[0].write(f"**Page:** {chunk['meta']['page']}")
+                    cols[1].write(f"**Words:** {chunk['meta']['words']}")
+                    cols[2].write(f"**Language OK:** {'✅' if not chunk['meta']['lang_mismatch'] else '❌'}")
+                    cols[3].write(f"**Doc ID:** {chunk['meta']['doc_id'][:8]}...")
+                    
+                    # Editable text area for the chunk content
+                    edited_text = st.text_area(
+                        "Content (editable)",
+                        value=chunk["text"],
+                        height=200,
+                        key=f"chunk_edit_{global_idx}_{doc_name}_{chunk['meta']['page']}",
+                        help="Edit the OCR text if needed. Changes will be preserved for embedding."
+                    )
+                    
+                    # Update the chunk in session state if edited
+                    if edited_text != chunk["text"]:
+                        st.session_state.ocr_chunks_by_document[doc_name][i]["text"] = edited_text
+                        st.session_state.ocr_chunks_by_document[doc_name][i]["meta"]["words"] = len(edited_text.split())
+                        edited_count += 1
     
     # Summary and action buttons
     st.divider()
@@ -492,42 +518,73 @@ def display_ocr_review_ui():
     with col2:
         if st.button("↩️ Reset All Edits", key="reset_edits"):
             # Reset to original OCR results
-            st.session_state.ocr_chunks_for_review = st.session_state.original_ocr_chunks.copy()
+            st.session_state.ocr_chunks_by_document = {k: v.copy() for k, v in st.session_state.original_ocr_chunks_by_document.items()}
+            # Reset timer
+            st.session_state.review_start_time = time.time()
             st.success("All edits reset!")
             time.sleep(1)
             st.rerun()
             
     with col3:
         if st.button("✅ Insert to Database", type="primary", key="proceed_embedding"):
-            # Clean up session state and proceed
-            reviewed_chunks = st.session_state.ocr_chunks_for_review.copy()
-            if "ocr_chunks_for_review" in st.session_state:
-                del st.session_state.ocr_chunks_for_review
-            if "original_ocr_chunks" in st.session_state:
-                del st.session_state.original_ocr_chunks
-            if "awaiting_review" in st.session_state:
-                del st.session_state.awaiting_review
-                
-            # Store the reviewed chunks for the next step
-            st.session_state.reviewed_chunks = reviewed_chunks
-            st.session_state.ready_for_embedding = True
-            st.rerun()
+            proceed_with_embedding()
             
         if st.button("❌ Cancel Ingestion", key="cancel_ingestion"):
             # Clean up session state
-            for key in ["ocr_chunks_for_review", "original_ocr_chunks", "awaiting_review", "reviewed_chunks", "ready_for_embedding"]:
-                if key in st.session_state:
-                    del st.session_state[key]
+            cleanup_session_state()
             st.warning("Ingestion cancelled by user.")
             time.sleep(1)
             st.rerun()
         
     return True
 
+def proceed_with_embedding():
+    """Proceed with embedding after review"""
+    # Flatten chunks from all documents
+    all_chunks = []
+    for chunks in st.session_state.ocr_chunks_by_document.values():
+        all_chunks.extend(chunks)
+    
+    # Store the reviewed chunks for the next step
+    st.session_state.reviewed_chunks = all_chunks
+    st.session_state.ready_for_embedding = True
+    
+    # Clean up review state
+    cleanup_review_state()
+    
+    st.rerun()
+
+def cleanup_review_state():
+    """Clean up OCR review state"""
+    keys_to_clean = [
+        "ocr_chunks_by_document", 
+        "original_ocr_chunks_by_document", 
+        "awaiting_review",
+        "review_start_time"
+    ]
+    for key in keys_to_clean:
+        if key in st.session_state:
+            del st.session_state[key]
+
+def cleanup_session_state():
+    """Clean up all ingestion-related session state"""
+    keys_to_clean = [
+        "ocr_chunks_by_document", 
+        "original_ocr_chunks_by_document", 
+        "awaiting_review",
+        "reviewed_chunks", 
+        "ready_for_embedding",
+        "review_start_time",
+        "stored_company"
+    ]
+    for key in keys_to_clean:
+        if key in st.session_state:
+            del st.session_state[key]
+
 # ===============================
 # OTHER HELPER FUNCTIONS
 # ===============================
-def ocr_pdf_with_deka(pdf_path: Path, company: str, source_name: str, progress_ocr, status_ocr) -> List[dict]:
+def ocr_pdf_with_deka(pdf_path: Path, company: str, source_name: str, progress_ocr, status_ocr, doc_num: int = 1, total_docs: int = 1) -> List[dict]:
     """
     Returns a list of dicts:
     { "page": int, "text": str, "lang_mismatch": bool, "words": int }
@@ -536,61 +593,110 @@ def ocr_pdf_with_deka(pdf_path: Path, company: str, source_name: str, progress_o
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
     success_pages = 0
+    failed_pages = 0
+    MAX_RETRIES = 3
 
     for i in range(total_pages):
-        status_ocr.write(f"🖼️ OCR page {i+1}/{total_pages}")
-        b64_image = page_image_base64(doc, i, zoom=3.0)
-
-        # Call DEKA OCR
-        resp = deka_client.chat.completions.create(
-            model=OCR_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an OCR engine specialized in Indonesian/English legal and technical contracts. "
-                        "Your task is to extract text *exactly as it appears* in the document image, without rewriting or summarizing.\n\n"
-                        "Guidelines:\n"
-                        "- Preserve all line breaks, numbering, and indentation.\n"
-                        "- Keep all headers, footers, and notes if they appear in the image.\n"
-                        "- Preserve tables as text: keep rows and columns aligned with | separators. output it in Markdown table format Pad cells so that columns align visually.\n"
-                        "- Do not translate text — output exactly as in the document.\n"
-                        "- If a cell or field is blank, or contains only dots/dashes (e.g., '.....', '—'), write N/A.\n"
-                        "- Keep units, percentages, currency (e.g., m², kVA, %, Rp.) exactly as written.\n"
-                        "- If text is unclear, output it as ??? instead of guessing."
+        status_ocr.write(f"🖼️ OCR Document {doc_num}/{total_docs} '{source_name}' - page {i+1}/{total_pages}")
+        retries = 0
+        page_success = False
+        last_error = None
+        
+        while retries < MAX_RETRIES and not page_success:
+            try:
+                b64_image = page_image_base64(doc, i, zoom=3.0)
+                
+                # Call DEKA OCR with extended timeout and error handling
+                try:
+                    resp = deka_client.chat.completions.create(
+                        model=OCR_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are an OCR engine specialized in Indonesian/English legal and technical contracts. "
+                                    "Your task is to extract text *exactly as it appears* in the document image, without rewriting or summarizing.\n\n"
+                                    "Guidelines:\n"
+                                    "- Preserve all line breaks, numbering, and indentation.\n"
+                                    "- Keep all headers, footers, and notes if they appear in the image.\n"
+                                    "- Preserve tables as text: keep rows and columns aligned with | separators. output it in Markdown table format Pad cells so that columns align visually.\n"
+                                    "- Do not translate text — output exactly as in the document.\n"
+                                    "- If a cell or field is blank, or contains only dots/dashes (e.g., '.....', '—'), write N/A.\n"
+                                    "- Keep units, percentages, currency (e.g., m², kVA, %, Rp.) exactly as written.\n"
+                                    "- If text is unclear, output it as ??? instead of guessing."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": f"Extract the text from this page {i+1} of the PDF."},
+                                    {"type": "image_url", "image_url": {
+                                        "url": f"data:image/jpeg;base64,{b64_image}"}}
+                                ]
+                            }
+                        ],
+                        max_tokens=8000,
+                        temperature=0,
+                        timeout=700  # Extended timeout to 700 seconds
                     )
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Extract the text from this page {i+1} of the PDF."},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64_image}"}}
-                    ]
-                }
-            ],
-            max_tokens=8000,
-            temperature=0,
-            timeout=120
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        text = _clean_text(text)
-
-        # language check + counts
-        lang_ok = keep_language(text, allowed_langs=ALLOWED_LANGS)
-        words = len(text.split())
-
-        pages_out.append({
-            "page": i + 1,
-            "text": text,
-            "lang_mismatch": not lang_ok,
-            "words": words,
-        })
-        success_pages += 1
-        progress_ocr.progress(int((success_pages / total_pages) * 100))
+                    text = (resp.choices[0].message.content or "").strip()
+                    text = _clean_text(text)
+                    
+                    # language check + counts
+                    lang_ok = keep_language(text, allowed_langs=ALLOWED_LANGS)
+                    words = len(text.split())
+                    
+                    pages_out.append({
+                        "page": i + 1,
+                        "text": text,
+                        "lang_mismatch": not lang_ok,
+                        "words": words,
+                    })
+                    success_pages += 1
+                    page_success = True
+                    
+                except Exception as e:
+                    # Handle API call errors
+                    retries += 1
+                    last_error = str(e)
+                    if retries < MAX_RETRIES:
+                        status_ocr.write(f"⚠️ Retrying Document {doc_num}/{total_docs} '{source_name}' page {i+1}/{total_pages} (attempt {retries+1}/{MAX_RETRIES})")
+                        time.sleep(2 ** retries)  # Exponential backoff
+                    else:
+                        raise  # Re-raise if all retries exhausted
+                        
+            except Exception as e:
+                # Handle image processing errors or exhausted retries
+                retries += 1
+                last_error = str(e)
+                if retries < MAX_RETRIES:
+                    status_ocr.write(f"⚠️ Retrying Document {doc_num}/{total_docs} '{source_name}' page {i+1}/{total_pages} (attempt {retries+1}/{MAX_RETRIES})")
+                    time.sleep(2 ** retries)  # Exponential backoff
+                else:
+                    # All retries exhausted
+                    failed_pages += 1
+                    error_msg = f"Failed to process page {i+1} after {MAX_RETRIES} attempts: {last_error}"
+                    st.warning(error_msg)
+                    # Add a placeholder for the failed page
+                    pages_out.append({
+                        "page": i + 1,
+                        "text": f"[OCR FAILED: {error_msg}]",
+                        "lang_mismatch": False,
+                        "words": 0,
+                    })
+                    page_success = True  # Break the retry loop
+                    
+        # Update progress
+        progress_ocr.progress(int(((success_pages + failed_pages) / total_pages) * 100))
 
     doc.close()
-    status_ocr.write("✅ OCR complete")
+    
+    # Show completion status
+    if failed_pages > 0:
+        status_ocr.write(f"⚠️ OCR for Document {doc_num}/{total_docs} '{source_name}' completed with {failed_pages} failed pages out of {total_pages}")
+    else:
+        status_ocr.write(f"✅ OCR for Document {doc_num}/{total_docs} '{source_name}' complete")
+        
     return pages_out
 
 def list_documents(limit: int = 1000):
@@ -690,63 +796,50 @@ with st.expander("🔒 Multi-Factor Authentication Settings"):
 
 # Check for successful ingestion and display success message
 if st.session_state.get("ingestion_success", False):
-    doc_id = st.session_state.get("success_doc_id", "")
+    doc_ids = st.session_state.get("success_doc_ids", [])
     collection = st.session_state.get("success_collection", "")
     chunks = st.session_state.get("success_chunks", 0)
+    documents = st.session_state.get("success_documents", 0)
     
-    st.success(f"✅ Document successfully ingested! {chunks} chunks upserted to `{collection}` (doc_id={doc_id}…)")
+    doc_ids_display = ", ".join([doc_id[:8] for doc_id in doc_ids])
+    if len(doc_ids) > 3:
+        doc_ids_display += ", ..."
+    
+    st.success(f"✅ {documents} document(s) successfully ingested! {chunks} chunks upserted to `{collection}` (doc_id={doc_ids_display})")
     
     # Clear the success flags
     del st.session_state.ingestion_success
-    if "success_doc_id" in st.session_state:
-        del st.session_state.success_doc_id
+    if "success_doc_ids" in st.session_state:
+        del st.session_state.success_doc_ids
     if "success_collection" in st.session_state:
         del st.session_state.success_collection
     if "success_chunks" in st.session_state:
         del st.session_state.success_chunks
+    if "success_documents" in st.session_state:
+        del st.session_state.success_documents
 
 # ===============================
 # 📚 Unified Vertical Layout
 # ===============================
-
-st.subheader("➕ Ingest New PDF")
-# Use session state to manage form inputs
-if "company_input" not in st.session_state:
-    st.session_state.company_input = ""
-if "docname_input" not in st.session_state:
-    st.session_state.docname_input = ""
-
-with st.form("ingest_form", clear_on_submit=True):
-    company = st.text_input(
-        "🏢 Company Name", 
-        value=st.session_state.company_input,
-        placeholder="e.g., PT Lintasarta",
-        key="company_input_field")
-    docname = st.text_input("📄 Document Name (filename)",
-                            value=st.session_state.docname_input,
-                            placeholder="e.g., Contract_ABC.pdf",
-                            key="docname_input_field")
-    uploaded = st.file_uploader("📎 Upload PDF", type=["pdf"], key="pdf_uploader")
-    go = st.form_submit_button("🚀 Ingest")
 
 # Check if we're ready for embedding (after review) - moved outside form handler
 if st.session_state.get("ready_for_embedding", False):
     # Get the reviewed chunks and proceed with embedding
     reviewed_chunks = st.session_state.get("reviewed_chunks", [])
     company = st.session_state.get("stored_company", "")
-    docname = st.session_state.get("stored_docname", "")
+    
+    # Extract document names from chunks for Supabase insertion
+    document_names = list(set(chunk["meta"]["source"] for chunk in reviewed_chunks))
     
     if "reviewed_chunks" in st.session_state:
         del st.session_state.reviewed_chunks
     if "ready_for_embedding" in st.session_state:
         del st.session_state.ready_for_embedding
-        if "stored_company" in st.session_state:
-            del st.session_state.stored_company
-        if "stored_docname" in st.session_state:
-            del st.session_state.stored_docname
+    if "stored_company" in st.session_state:
+        del st.session_state.stored_company
         
     # Show loading spinner during processing
-    with st.spinner("Processing document..."):
+    with st.spinner("Processing documents..."):
         st.info("Starting embedding and upload... (append mode)")
 
         # Progress sections
@@ -816,32 +909,34 @@ if st.session_state.get("ready_for_embedding", False):
 
                 status_upload.write("✅ Upload complete")
                 
-                # Add to Supabase
-                add_to_supabase(company, docname)
+                # Add each document to Supabase
+                for docname in document_names:
+                    add_to_supabase(company, docname)
                 
                 return {
-                    "doc_id": chunks[0]["meta"]["doc_id"] if chunks else "unknown",
+                    "doc_ids": list(set(chunk["meta"]["doc_id"] for chunk in chunks)),
                     "chunks": len(chunks),
                     "uploaded": len(ids),
                     "collection": QDRANT_COLLECTION,
+                    "documents": len(document_names)
                 }
             
             result = run_embedding_and_upload(reviewed_chunks)
 
             # Clear the form inputs after successful ingestion
             st.session_state.company_input = ""
-            st.session_state.docname_input = ""
             
             st.success(
                 f"✅ Done! {result['uploaded']} chunks upserted to `{result['collection']}` "
-                f"(doc_id={result['doc_id'][:8]}…)."
+                f"from {result['documents']} document(s) for company '{company}'."
             )
             
             # Set success flag in session state
             st.session_state.ingestion_success = True
-            st.session_state.success_doc_id = result['doc_id'][:8]
+            st.session_state.success_doc_ids = result['doc_ids'][:3]  # Show first 3
             st.session_state.success_collection = result['collection']
             st.session_state.success_chunks = result['uploaded']
+            st.session_state.success_documents = result['documents']
             
             # Force a rerun to refresh the document list
             time.sleep(1)
@@ -850,19 +945,10 @@ if st.session_state.get("ready_for_embedding", False):
         except Exception as e:
             st.error(f"🚫 Ingestion failed: {e}")
             st.error(f"Error details: {str(e)}")
-
-# Handle form submission
-if go:
-    if not company or not docname or not uploaded:
-        st.warning("⚠️ Please fill all fields and upload a PDF.")
-    else:
-        # Store form values in session state for later use
-        st.session_state.stored_company = company
-        st.session_state.stored_docname = docname
         
         # Show loading spinner during OCR processing
-        with st.spinner("Processing document..."):
-            st.info("Starting OCR processing…")
+        with st.spinner("Processing documents..."):
+            st.info(f"Starting OCR processing for {len(uploaded_files)} document(s)…")
 
             # Progress sections
             with st.expander("🔎 OCR Progress", expanded=True):
@@ -870,53 +956,83 @@ if go:
                 status_ocr = st.empty()
 
             try:
-                # Save uploaded PDF (organized by company)
-                save_dir = Path("uploads") / company
-                save_dir.mkdir(parents=True, exist_ok=True)
-                pdf_path = save_dir / docname
-                pdf_path.write_bytes(uploaded.getvalue())
-
-                # Create doc hash for stable IDs
-                doc_id = deterministic_doc_hash(pdf_path, uploaded.getvalue())
+                all_chunks = []
+                successful_docs = 0
                 
-                # Capture upload time in ISO format for consistency
-                upload_time = datetime.datetime.now().isoformat()
+                # Process each uploaded file
+                for idx, uploaded_file in enumerate(uploaded_files):
+                    status_ocr.write(f"Processing document {idx+1}/{len(uploaded_files)}: {uploaded_file.name}")
+                    
+                    # Use the uploaded file name as document name
+                    docname = uploaded_file.name
+                    
+                    # Save uploaded PDF (organized by company)
+                    save_dir = Path("uploads") / company
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    pdf_path = save_dir / docname
+                    pdf_path.write_bytes(uploaded_file.getvalue())
 
-                # 1) OCR per page
-                ocr_pages = ocr_pdf_with_deka(
-                    pdf_path, company, docname, progress_ocr, status_ocr)
+                    # Create doc hash for stable IDs
+                    doc_id = deterministic_doc_hash(pdf_path, uploaded_file.getvalue())
+                    
+                    # Capture upload time in ISO format for consistency
+                    upload_time = datetime.datetime.now().isoformat()
 
-                # 2) Build chunks (here: 1 chunk per page + header as you do)
-                chunks = []
-                for page_info in ocr_pages:
-                    t = page_info["text"]
-                    if not t:
-                        continue
-                    header = build_meta_header(
-                        {"company": company, "source": docname, "page": page_info["page"]})
-                    full_text = (header + t).strip()
+                    # 1) OCR per page for this document
+                    ocr_pages = ocr_pdf_with_deka(
+                        pdf_path, company, docname, progress_ocr, status_ocr, idx+1, len(uploaded_files))
 
-                    chunks.append({
-                        "id_raw": f"{doc_id}:{page_info['page']}",
-                        "text": full_text,
-                        "meta": {
-                            "company": company,
-                            "source": docname,
-                            "page": page_info["page"],
-                            "path": str(pdf_path.resolve()),
-                            "doc_id": doc_id,
-                            "words": page_info["words"],
-                            "lang_mismatch": page_info["lang_mismatch"],
-                            "upload_time": upload_time,
-                        }
-                    })
+                    # 2) Build chunks (here: 1 chunk per page + header as you do)
+                    chunks = []
+                    for page_info in ocr_pages:
+                        t = page_info["text"]
+                        if not t:
+                            continue
+                        header = build_meta_header(
+                            {"company": company, "source": docname, "page": page_info["page"]})
+                        full_text = (header + t).strip()
 
-                # Store chunks in session state for review
-                st.session_state.ocr_chunks_for_review = chunks
-                st.session_state.original_ocr_chunks = chunks.copy()
-                st.session_state.awaiting_review = True
-                
-                st.info("OCR complete. Please review the chunks below before proceeding.")
+                        chunks.append({
+                            "id_raw": f"{doc_id}:{page_info['page']}",
+                            "text": full_text,
+                            "meta": {
+                                "company": company,
+                                "source": docname,
+                                "page": page_info["page"],
+                                "path": str(pdf_path.resolve()),
+                                "doc_id": doc_id,
+                                "words": page_info["words"],
+                                "lang_mismatch": page_info["lang_mismatch"],
+                                "upload_time": upload_time,
+                            }
+                        })
+                    
+                    # Add chunks from this document to all chunks
+                    all_chunks.extend(chunks)
+                    successful_docs += 1
+                    
+                    # Update overall progress
+                    progress_ocr.progress(int(((idx + 1) / len(uploaded_files)) * 100))
+
+                if successful_docs > 0:
+                    # Group chunks by document for review
+                    chunks_by_document = {}
+                    for chunk in all_chunks:
+                        source = chunk["meta"]["source"]
+                        if source not in chunks_by_document:
+                            chunks_by_document[source] = []
+                        chunks_by_document[source].append(chunk)
+                    
+                    # Store chunks in session state for review
+                    st.session_state.ocr_chunks_by_document = chunks_by_document
+                    st.session_state.original_ocr_chunks_by_document = {k: v.copy() for k, v in chunks_by_document.items()}
+                    st.session_state.awaiting_review = True
+                    st.session_state.review_start_time = time.time()  # Track when review started
+                    
+                    st.success(f"OCR complete for {successful_docs} document(s). Please review the chunks below before proceeding.")
+                else:
+                    st.error("No documents were processed successfully.")
+                    
                 time.sleep(1)
                 st.rerun()
 
@@ -926,6 +1042,123 @@ if go:
 
 # Display OCR review UI if there are chunks to review
 display_ocr_review_ui()
+
+st.markdown("---")
+st.subheader("➕ Ingest New PDF")
+# Use session state to manage form inputs
+if "company_input" not in st.session_state:
+    st.session_state.company_input = ""
+
+with st.form("ingest_form_main", clear_on_submit=True):
+    company = st.text_input(
+        "🏢 Company Name", 
+        value=st.session_state.company_input,
+        placeholder="e.g., PT Lintasarta",
+        key="company_input_field")
+    uploaded_files = st.file_uploader("📎 Upload PDF(s)", type=["pdf"], accept_multiple_files=True, key="pdf_uploader")
+    go = st.form_submit_button("🚀 Ingest")
+    
+    # Handle form submission
+    if go:
+        if not company or not uploaded_files:
+            st.warning("⚠️ Please fill the company name and upload at least one PDF.")
+        else:
+            # Store company name in session state for later use
+            st.session_state.stored_company = company
+            
+            # Show loading spinner during OCR processing
+            with st.spinner("Processing documents..."):
+                st.info(f"Starting OCR processing for {len(uploaded_files)} document(s)…")
+
+                # Progress sections
+                with st.expander("🔎 OCR Progress", expanded=True):
+                    progress_ocr = st.progress(0)
+                    status_ocr = st.empty()
+
+                try:
+                    all_chunks = []
+                    successful_docs = 0
+                    
+                    # Process each uploaded file
+                    for idx, uploaded_file in enumerate(uploaded_files):
+                        status_ocr.write(f"Processing document {idx+1}/{len(uploaded_files)}: {uploaded_file.name}")
+                        
+                        # Use the uploaded file name as document name
+                        docname = uploaded_file.name
+                        
+                        # Save uploaded PDF (organized by company)
+                        save_dir = Path("uploads") / company
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        pdf_path = save_dir / docname
+                        pdf_path.write_bytes(uploaded_file.getvalue())
+
+                        # Create doc hash for stable IDs
+                        doc_id = deterministic_doc_hash(pdf_path, uploaded_file.getvalue())
+                        
+                        # Capture upload time in ISO format for consistency
+                        upload_time = datetime.datetime.now().isoformat()
+
+                        # 1) OCR per page for this document
+                        ocr_pages = ocr_pdf_with_deka(
+                            pdf_path, company, docname, progress_ocr, status_ocr, idx+1, len(uploaded_files))
+
+                        # 2) Build chunks (here: 1 chunk per page + header as you do)
+                        chunks = []
+                        for page_info in ocr_pages:
+                            t = page_info["text"]
+                            if not t:
+                                continue
+                            header = build_meta_header(
+                                {"company": company, "source": docname, "page": page_info["page"]})
+                            full_text = (header + t).strip()
+
+                            chunks.append({
+                                "id_raw": f"{doc_id}:{page_info['page']}",
+                                "text": full_text,
+                                "meta": {
+                                    "company": company,
+                                    "source": docname,
+                                    "page": page_info["page"],
+                                    "path": str(pdf_path.resolve()),
+                                    "doc_id": doc_id,
+                                    "words": page_info["words"],
+                                    "lang_mismatch": page_info["lang_mismatch"],
+                                    "upload_time": upload_time,
+                                }
+                            })
+                        
+                        # Add chunks from this document to all chunks
+                        all_chunks.extend(chunks)
+                        successful_docs += 1
+                        
+                        # Update overall progress
+                        progress_ocr.progress(int(((idx + 1) / len(uploaded_files)) * 100))
+
+                    if successful_docs > 0:
+                        # Group chunks by document for review
+                        chunks_by_document = {}
+                        for chunk in all_chunks:
+                            source = chunk["meta"]["source"]
+                            if source not in chunks_by_document:
+                                chunks_by_document[source] = []
+                            chunks_by_document[source].append(chunk)
+                        
+                        # Store chunks in session state for review
+                        st.session_state.ocr_chunks_by_document = chunks_by_document
+                        st.session_state.original_ocr_chunks_by_document = {k: v.copy() for k, v in chunks_by_document.items()}
+                        st.session_state.awaiting_review = True
+                        st.session_state.review_start_time = time.time()  # Track when review started
+                        
+                        st.success(f"OCR complete for {successful_docs} document(s). Please review the chunks below before proceeding.")
+                    else:
+                        st.error("No documents were processed successfully.")
+                        
+                    time.sleep(1)
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"🚫 OCR processing failed: {e}")
+                    st.error(f"Error details: {str(e)}")
 
 st.markdown("---")
 st.subheader("📄 Documents Stored in Qdrant")
