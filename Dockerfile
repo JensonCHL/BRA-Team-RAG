@@ -15,9 +15,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your project
-COPY . .
-
+# Create directories but don't copy application code
+# Code will be mounted as a volume in docker-compose
 RUN mkdir -p uploads artifacts
 
 EXPOSE 80
